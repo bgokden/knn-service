@@ -11,7 +11,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
-	"github.com/hongshibao/go-kdtree"
+	"github.com/bgokden/go-kdtree"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/testdata"
 
@@ -37,6 +37,21 @@ type EuclideanPoint struct {
 	kdtree.PointBase
 	timestamp int64
 	label     string
+}
+
+// Return the label
+func (p *EuclideanPoint) GetLabel() string {
+	return p.label
+}
+
+// Return the timestamp
+func (p *EuclideanPoint) GetTimestamp() int64 {
+	return p.timestamp
+}
+
+// Return the value X_{dim}, dim is started from 0
+func (p *EuclideanPoint) GetValue(dim int) float64 {
+	return 0.0
 }
 
 func (p *EuclideanPoint) Distance(other kdtree.Point) float64 {
@@ -98,17 +113,24 @@ func equal(p1 kdtree.Point, p2 kdtree.Point) bool {
 func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.KnnResponse, error) {
 	point := NewEuclideanPointArr(in.GetFeature())
 	ans := s.tree.KNN(point, int(in.GetK()))
+	responseFeatures := make([]*pb.Feature, 0)
 	for i := 0; i < len(ans); i++ {
 		log.Println(ans[i])
+		feature := &pb.Feature{
+			Feature:   ans[i].GetValues(),
+			Timestamp: ans[i].GetTimestamp(),
+			Label:     ans[i].GetLabel(),
+		}
+		responseFeatures = append(responseFeatures, feature)
 	}
-	return &pb.KnnResponse{Id: in.Id}, nil
+	return &pb.KnnResponse{Id: in.Id, Features: responseFeatures}, nil
 }
 
 func newServer() *knnServiceServer {
-	p1 := NewEuclideanPointWithLabel(0, "p1", 0.0, 0.0, 0.0)
-	p2 := NewEuclideanPointWithLabel(0, "p2", 0.0, 0.0, 1.0)
-	p3 := NewEuclideanPointWithLabel(0, "p3", 0.0, 1.0, 0.0)
-	p4 := NewEuclideanPointWithLabel(0, "p4", 1.0, 0.0, 0.0)
+	p1 := NewEuclideanPointWithLabel(time.Now().Unix(), "p1", 0.0, 0.0, 0.0)
+	p2 := NewEuclideanPointWithLabel(time.Now().Unix(), "p2", 0.0, 0.0, 1.0)
+	p3 := NewEuclideanPointWithLabel(time.Now().Unix(), "p3", 0.0, 1.0, 0.0)
+	p4 := NewEuclideanPointWithLabel(time.Now().Unix(), "p4", 1.0, 0.0, 0.0)
 	points := make([]kdtree.Point, 0)
 	points = append(points, p1)
 	points = append(points, p2)
@@ -116,17 +138,20 @@ func newServer() *knnServiceServer {
 	points = append(points, p4)
 	tree := kdtree.NewKDTree(points)
 	s := &knnServiceServer{tree: tree}
-	// ans := tree.KNN(NewEuclideanPoint(0.0, 0.0, 0.1), 2)
 	return s
 }
 
 func callKnn(client pb.KnnServiceClient, request *pb.KnnRequest) {
 	resp, err := client.GetKnn(context.Background(), request)
 	if err != nil {
-		log.Fatalf("Could not create Customer: %v", err)
+		log.Fatalf("There is an error: %v", err)
 	}
 	// if resp.Success {
-	log.Printf("A new Customer has been added with id: %d", resp.Id)
+	log.Printf("A new Response has been received with id: %d", resp.Id)
+	features := resp.GetFeatures()
+	for i := 0; i < len(features); i++ {
+		log.Println(features[i].GetLabel())
+	}
 	// }
 }
 
