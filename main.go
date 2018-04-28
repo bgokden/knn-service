@@ -4,7 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -27,10 +29,10 @@ var (
 )
 
 type knnServiceServer struct {
-	savedFeatures []*pb.Feature // read-only after initialized
-
-	mu   sync.Mutex // protects KDTree
-	tree *kdtree.KDTree
+	pointsMu sync.RWMutex   // protects points
+	points   []kdtree.Point // read-only after initialized
+	treeMu   sync.RWMutex   // protects KDTree
+	tree     *kdtree.KDTree
 }
 
 type EuclideanPoint struct {
@@ -47,11 +49,6 @@ func (p *EuclideanPoint) GetLabel() string {
 // Return the timestamp
 func (p *EuclideanPoint) GetTimestamp() int64 {
 	return p.timestamp
-}
-
-// Return the value X_{dim}, dim is started from 0
-func (p *EuclideanPoint) GetValue(dim int) float64 {
-	return 0.0
 }
 
 func (p *EuclideanPoint) Distance(other kdtree.Point) float64 {
@@ -112,7 +109,9 @@ func equal(p1 kdtree.Point, p2 kdtree.Point) bool {
 // CreateCustomer creates a new Customer
 func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.KnnResponse, error) {
 	point := NewEuclideanPointArr(in.GetFeature())
+	s.treeMu.RLock()
 	ans := s.tree.KNN(point, int(in.GetK()))
+	s.treeMu.RUnlock()
 	responseFeatures := make([]*pb.Feature, 0)
 	for i := 0; i < len(ans); i++ {
 		log.Println(ans[i])
@@ -124,6 +123,19 @@ func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.K
 		responseFeatures = append(responseFeatures, feature)
 	}
 	return &pb.KnnResponse{Id: in.Id, Features: responseFeatures}, nil
+}
+
+func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) (*pb.InsertionResponse, error) {
+	point := NewEuclideanPointArrWithLabel(in.GetFeature(), in.GetTimestamp(), in.GetLabel())
+	s.pointsMu.Lock()
+	s.points = append(s.points, point)
+	s.pointsMu.Unlock()
+	s.pointsMu.RLock()
+	s.treeMu.Lock()
+	s.tree = kdtree.NewKDTree(s.points)
+	s.treeMu.Unlock()
+	s.pointsMu.RUnlock()
+	return &pb.InsertionResponse{Id: in.Id, Code: 0}, nil
 }
 
 func newServer() *knnServiceServer {
@@ -141,7 +153,18 @@ func newServer() *knnServiceServer {
 	return s
 }
 
-func callKnn(client pb.KnnServiceClient, request *pb.KnnRequest) {
+func callKnn(client pb.KnnServiceClient) {
+	request := &pb.KnnRequest{
+		Id:        101,
+		Timestamp: 1233234,
+		Timeout:   5,
+		K:         3,
+		Feature: []float64{
+			0.0,
+			0.0,
+			0.0,
+		},
+	}
 	resp, err := client.GetKnn(context.Background(), request)
 	if err != nil {
 		log.Fatalf("There is an error: %v", err)
@@ -152,6 +175,26 @@ func callKnn(client pb.KnnServiceClient, request *pb.KnnRequest) {
 	for i := 0; i < len(features); i++ {
 		log.Println(features[i].GetLabel())
 	}
+	// }
+}
+
+func callInsert(client pb.KnnServiceClient) {
+	request := &pb.InsertionRequest{
+		Id:        102,
+		Timestamp: time.Now().Unix(),
+		Label:     "po" + strconv.FormatInt(int64(rand.Intn(100)), 10),
+		Feature: []float64{
+			rand.Float64(),
+			rand.Float64(),
+			rand.Float64(),
+		},
+	}
+	resp, err := client.Insert(context.Background(), request)
+	if err != nil {
+		log.Fatalf("There is an error: %v", err)
+	}
+	// if resp.Success {
+	log.Printf("A new Response has been received with id: %d , code: %d", resp.Id, resp.Code)
 	// }
 }
 
@@ -166,19 +209,9 @@ func check() {
 		defer conn.Close()
 		client := pb.NewKnnServiceClient(conn)
 
-		request := &pb.KnnRequest{
-			Id:        101,
-			Timestamp: 1233234,
-			Timeout:   5,
-			K:         3,
-			Feature: []float64{
-				0.0,
-				0.0,
-				0.0,
-			},
-		}
+		callKnn(client)
 
-		callKnn(client, request)
+		callInsert(client)
 
 		// do some job
 		log.Println(time.Now().UTC())

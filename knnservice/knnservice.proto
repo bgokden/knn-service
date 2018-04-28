@@ -8,6 +8,7 @@ service KnnService {
   // rpc GetCustomers(CustomerFilter) returns (stream CustomerRequest) {}
   // Create a new Customer - A simple RPC
   rpc GetKnn(KnnRequest) returns (KnnResponse) {}
+  rpc Insert(InsertionRequest) returns (InsertionResponse) {}
 }
 
 // Request message for creating a new customer
@@ -28,4 +29,16 @@ message Feature {
 message KnnResponse {
   int32 id = 1;
   repeated Feature features = 2;
+}
+
+message InsertionRequest {
+  int32 id = 1;
+  int64 timestamp = 2;
+  string label = 3;
+  repeated double feature = 4;
+}
+
+message InsertionResponse {
+  int32 id = 1;
+  int32 code = 2;
 }
