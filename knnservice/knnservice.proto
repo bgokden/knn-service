@@ -1,0 +1,31 @@
+syntax = "proto3";
+package knnservice;
+
+// protoc -I knnservice/ knnservice/knnservice.proto --go_out=plugins=grpc:knnservice
+// The Customer service definition.
+service KnnService {
+  // Get all Customers with filter - A server-to-client streaming RPC.
+  // rpc GetCustomers(CustomerFilter) returns (stream CustomerRequest) {}
+  // Create a new Customer - A simple RPC
+  rpc GetKnn(KnnRequest) returns (KnnResponse) {}
+}
+
+// Request message for creating a new customer
+message KnnRequest {
+  int32 id = 1;  // Unique ID number for a Customer.
+  int64 timestamp = 2;
+  int64 timeout = 3;
+  int32 k = 4;
+  repeated double feature = 5;
+}
+
+message Feature {
+  repeated double feature = 1;
+  int64 timestamp = 2;
+  string label = 3;
+}
+
+message KnnResponse {
+  int32 id = 1;
+  repeated Feature features = 2;
+}
