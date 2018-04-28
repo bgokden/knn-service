@@ -1,11 +1,12 @@
 # build stage
 FROM golang:alpine AS build-env
 RUN apk add --no-cache git
-ADD . /src
-RUN cd /src && go get && go build -o goapp
+WORKDIR /go/src/app
+ADD ./ .
+RUN go get && go build -o goapp
 
 # final stage
 FROM alpine
 WORKDIR /app
-COPY --from=build-env /src/goapp /app/
+COPY --from=build-env /go/src/app/goapp /app/
 ENTRYPOINT ./goapp
