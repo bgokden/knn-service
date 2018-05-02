@@ -28,15 +28,31 @@ var (
 	port       = flag.Int("port", 10000, "The server port")
 )
 
+const k = 3
+
 type knnServiceServer struct {
-	pointsMu sync.RWMutex   // protects points
-	points   []kdtree.Point // read-only after initialized
-	treeMu   sync.RWMutex   // protects KDTree
-	tree     *kdtree.KDTree
+	k         int64
+	avg       [k]float64
+	n         int64
+	pointsMap sync.Map
+	pointsMu  sync.RWMutex   // protects points
+	points    []kdtree.Point // read-only after initialized
+	treeMu    sync.RWMutex   // protects KDTree
+	tree      *kdtree.KDTree
 }
 
 type EuclideanPoint struct {
 	kdtree.PointBase
+	timestamp int64
+	label     string
+}
+
+type EuclideanPointKey struct {
+	feature   [k]float64
+	timestamp int64
+}
+
+type EuclideanPointValue struct {
 	timestamp int64
 	label     string
 }
@@ -88,9 +104,11 @@ func NewEuclideanPointArr(vals []float64) *EuclideanPoint {
 	return ret
 }
 
-func NewEuclideanPointArrWithLabel(vals []float64, timestamp int64, label string) *EuclideanPoint {
+func NewEuclideanPointArrWithLabel(vals [k]float64, timestamp int64, label string) *EuclideanPoint {
+	slice := make([]float64, k)
+	copy(slice, vals[:])
 	ret := &EuclideanPoint{
-		PointBase: kdtree.NewPointBase(vals),
+		PointBase: kdtree.NewPointBase(slice),
 		timestamp: timestamp,
 		label:     label,
 	}
@@ -109,37 +127,60 @@ func equal(p1 kdtree.Point, p2 kdtree.Point) bool {
 // CreateCustomer creates a new Customer
 func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.KnnResponse, error) {
 	point := NewEuclideanPointArr(in.GetFeature())
-	s.treeMu.RLock()
-	ans := s.tree.KNN(point, int(in.GetK()))
-	s.treeMu.RUnlock()
-	responseFeatures := make([]*pb.Feature, 0)
-	for i := 0; i < len(ans); i++ {
-		log.Println(ans[i])
-		feature := &pb.Feature{
-			Feature:   ans[i].GetValues(),
-			Timestamp: ans[i].GetTimestamp(),
-			Label:     ans[i].GetLabel(),
+	if s.tree != nil {
+		s.treeMu.RLock()
+		ans := s.tree.KNN(point, int(in.GetK()))
+		s.treeMu.RUnlock()
+		responseFeatures := make([]*pb.Feature, 0)
+		for i := 0; i < len(ans); i++ {
+			log.Println(ans[i])
+			feature := &pb.Feature{
+				Feature:   ans[i].GetValues(),
+				Timestamp: ans[i].GetTimestamp(),
+				Label:     ans[i].GetLabel(),
+			}
+			responseFeatures = append(responseFeatures, feature)
 		}
-		responseFeatures = append(responseFeatures, feature)
+		return &pb.KnnResponse{Id: in.Id, Features: responseFeatures}, nil
 	}
-	return &pb.KnnResponse{Id: in.Id, Features: responseFeatures}, nil
+	return &pb.KnnResponse{Id: in.Id, Features: nil}, nil
 }
 
 func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) (*pb.InsertionResponse, error) {
-	point := NewEuclideanPointArrWithLabel(in.GetFeature(), in.GetTimestamp(), in.GetLabel())
-	s.pointsMu.Lock()
-	s.points = append(s.points, point)
-	s.pointsMu.Unlock()
-	s.pointsMu.RLock()
-	s.treeMu.Lock()
-	s.tree = kdtree.NewKDTree(s.points)
-	s.treeMu.Unlock()
-	s.pointsMu.RUnlock()
+	key := EuclideanPointKey{
+		timestamp: in.GetTimestamp(),
+	}
+	copy(key.feature[:], in.GetFeature())
+	value := EuclideanPointValue{
+		timestamp: in.GetTimestamp(),
+		label:     in.GetLabel(),
+	}
+	s.pointsMap.Store(key, value)
 	return &pb.InsertionResponse{Id: in.Id, Code: 0}, nil
 }
 
+func (s *knnServiceServer) syncMapToTree() {
+	points := make([]kdtree.Point, 0)
+	s.pointsMap.Range(func(key, value interface{}) bool {
+		euclideanPointKey := key.(EuclideanPointKey)
+		euclideanPointValue := value.(EuclideanPointValue)
+		point := NewEuclideanPointArrWithLabel(
+			euclideanPointKey.feature,
+			euclideanPointKey.timestamp,
+			euclideanPointValue.label)
+		points = append(points, point)
+		return true
+	})
+	if len(points) > 0 {
+		tree := kdtree.NewKDTree(points)
+		s.treeMu.Lock()
+		s.tree = tree
+		s.treeMu.Unlock()
+	}
+}
+
 func newServer() *knnServiceServer {
-	p1 := NewEuclideanPointWithLabel(time.Now().Unix(), "p1", 0.0, 0.0, 0.0)
+	/* p1 := NewEuclideanPointWithLabel(time.Now().Unix(), "p1", 0.0, 0.0, 0.0)
 	p2 := NewEuclideanPointWithLabel(time.Now().Unix(), "p2", 0.0, 0.0, 1.0)
 	p3 := NewEuclideanPointWithLabel(time.Now().Unix(), "p3", 0.0, 1.0, 0.0)
 	p4 := NewEuclideanPointWithLabel(time.Now().Unix(), "p4", 1.0, 0.0, 0.0)
@@ -148,14 +189,14 @@ func newServer() *knnServiceServer {
 	points = append(points, p2)
 	points = append(points, p3)
 	points = append(points, p4)
-	tree := kdtree.NewKDTree(points)
-	s := &knnServiceServer{tree: tree}
+	tree := kdtree.NewKDTree(points) */
+	s := &knnServiceServer{}
 	return s
 }
 
 func callKnn(client pb.KnnServiceClient) {
 	request := &pb.KnnRequest{
-		Id:        101,
+		Id:        "101",
 		Timestamp: 1233234,
 		Timeout:   5,
 		K:         3,
@@ -170,7 +211,7 @@ func callKnn(client pb.KnnServiceClient) {
 		log.Fatalf("There is an error: %v", err)
 	}
 	// if resp.Success {
-	log.Printf("A new Response has been received with id: %d", resp.Id)
+	log.Printf("A new Response has been received with id: %s", resp.Id)
 	features := resp.GetFeatures()
 	for i := 0; i < len(features); i++ {
 		log.Println(features[i].GetLabel())
@@ -180,7 +221,7 @@ func callKnn(client pb.KnnServiceClient) {
 
 func callInsert(client pb.KnnServiceClient) {
 	request := &pb.InsertionRequest{
-		Id:        102,
+		Id:        "102",
 		Timestamp: time.Now().Unix(),
 		Label:     "po" + strconv.FormatInt(int64(rand.Intn(100)), 10),
 		Feature: []float64{
@@ -194,11 +235,11 @@ func callInsert(client pb.KnnServiceClient) {
 		log.Fatalf("There is an error: %v", err)
 	}
 	// if resp.Success {
-	log.Printf("A new Response has been received with id: %d , code: %d", resp.Id, resp.Code)
+	log.Printf("A new Response has been received with id: %s , code: %d", resp.Id, resp.Code)
 	// }
 }
 
-func check() {
+func (s *knnServiceServer) check() {
 	for {
 		// var opts []grpc.DialOption
 		// var serverAddr string = "localhost:10000"
@@ -212,6 +253,8 @@ func check() {
 		callKnn(client)
 
 		callInsert(client)
+
+		s.syncMapToTree()
 
 		// do some job
 		log.Println(time.Now().UTC())
@@ -240,8 +283,9 @@ func main() {
 		opts = []grpc.ServerOption{grpc.Creds(creds)}
 	}
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterKnnServiceServer(grpcServer, newServer())
-	go check()
+	s := newServer()
+	pb.RegisterKnnServiceServer(grpcServer, s)
+	go s.check()
 	log.Println("Server started")
 	grpcServer.Serve(lis)
 }

@@ -13,7 +13,7 @@ service KnnService {
 
 // Request message for creating a new customer
 message KnnRequest {
-  int32 id = 1;  // Unique ID number for a Customer.
+  string id = 1;  // Unique ID number for a Request.
   int64 timestamp = 2;
   int64 timeout = 3;
   int32 k = 4;
@@ -27,18 +27,18 @@ message Feature {
 }
 
 message KnnResponse {
-  int32 id = 1;
+  string id = 1;
   repeated Feature features = 2;
 }
 
 message InsertionRequest {
-  int32 id = 1;
+  string id = 1;
   int64 timestamp = 2;
   string label = 3;
   repeated double feature = 4;
 }
 
 message InsertionResponse {
-  int32 id = 1;
+  string id = 1;
   int32 code = 2;
 }
