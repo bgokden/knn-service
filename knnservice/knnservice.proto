@@ -9,6 +9,9 @@ service KnnService {
   // Create a new Customer - A simple RPC
   rpc GetKnn(KnnRequest) returns (KnnResponse) {}
   rpc Insert(InsertionRequest) returns (InsertionResponse) {}
+  rpc Join(JoinRequest) returns (JoinResponse) {}
+  rpc ExchangeServices(ServiceMessage) returns (ServiceMessage) {}
+  rpc ExchangePeers(PeerMessage) returns (PeerMessage) {}
 }
 
 // Request message for creating a new customer
@@ -41,4 +44,32 @@ message InsertionRequest {
 message InsertionResponse {
   string id = 1;
   int32 code = 2;
+}
+
+message ServiceMessage {
+  repeated string services = 1;
+}
+
+message Peer {
+  string address = 1;
+  int64 timestamp = 2;
+  string version = 3;
+  repeated double avg = 4;
+  repeated double feature = 5;
+}
+
+message PeerMessage {
+  repeated Peer peers = 1;
+}
+
+message JoinRequest {
+  string address = 1; // known address
+  int32 port = 2;
+  repeated double avg = 3; // known avg
+  string version = 4;
+  repeated double feature = 5; // extra features
+}
+
+message JoinResponse {
+  string address = 1; // received address
 }

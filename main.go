@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,9 +16,11 @@ import (
 
 	"github.com/bgokden/go-kdtree"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/testdata"
 
 	pb "github.com/bgokden/knn-service/knnservice"
+	"github.com/segmentio/ksuid"
 )
 
 var (
@@ -30,11 +33,21 @@ var (
 
 const k = 3
 
+type Peer struct {
+	address string
+	version string
+	avg     []float64
+}
+
 type knnServiceServer struct {
 	k         int64
-	avg       [k]float64
+	avg       []float64
 	n         int64
+	address   string
+	version   string
 	pointsMap sync.Map
+	services  sync.Map
+	peers     sync.Map
 	pointsMu  sync.RWMutex   // protects points
 	points    []kdtree.Point // read-only after initialized
 	treeMu    sync.RWMutex   // protects KDTree
@@ -159,6 +172,162 @@ func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) 
 	return &pb.InsertionResponse{Id: in.Id, Code: 0}, nil
 }
 
+func (s *knnServiceServer) Join(ctx context.Context, in *pb.JoinRequest) (*pb.JoinResponse, error) {
+	p, _ := peer.FromContext(ctx)
+	address := strings.Split(p.Addr.String(), ":")[0] + ":" + strconv.FormatInt(int64(in.GetPort()), 10)
+	log.Printf("Peer Addr: %s", address)
+	peer := Peer{
+		address: address,
+		avg:     in.GetAvg(),
+		version: in.GetVersion(),
+	}
+	s.peers.Store(address, peer)
+	return &pb.JoinResponse{Address: address}, nil
+}
+
+func (s *knnServiceServer) ExchangeServices(ctx context.Context, in *pb.ServiceMessage) (*pb.ServiceMessage, error) {
+	inputServiceList := in.GetServices()
+	for i := 0; i < len(inputServiceList); i++ {
+		s.services.Store(inputServiceList[i], true)
+	}
+	outputServiceList := make([]string, 0)
+	s.services.Range(func(key, value interface{}) bool {
+		serviceName := key.(string)
+		outputServiceList = append(outputServiceList, serviceName)
+		return true
+	})
+	return &pb.ServiceMessage{Services: outputServiceList}, nil
+}
+
+func (s *knnServiceServer) ExchangePeers(ctx context.Context, in *pb.PeerMessage) (*pb.PeerMessage, error) {
+	inputPeerList := in.GetPeers()
+	for i := 0; i < len(inputPeerList); i++ {
+		peer := Peer{
+			address: inputPeerList[i].GetAddress(),
+			version: inputPeerList[i].GetVersion(),
+			avg:     inputPeerList[i].GetAvg(),
+		}
+		s.peers.Store(inputPeerList[i].GetAddress(), peer)
+	}
+	outputPeerList := make([]*pb.Peer, 0)
+	s.peers.Range(func(key, value interface{}) bool {
+		// address := key.(string)
+		peer := value.(Peer)
+		peerProto := &pb.Peer{
+			Address: peer.address,
+			Version: peer.version,
+			Avg:     peer.avg,
+		}
+		outputPeerList = append(outputPeerList, peerProto)
+		return true
+	})
+	return &pb.PeerMessage{Peers: outputPeerList}, nil
+}
+
+func (s *knnServiceServer) getClient(address string) (*pb.KnnServiceClient, *grpc.ClientConn) {
+	conn, err := grpc.Dial(address, grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("fail to dial: %v", err)
+	}
+	client := pb.NewKnnServiceClient(conn)
+	return &client, conn
+}
+
+func (s *knnServiceServer) callJoin(client *pb.KnnServiceClient) {
+	request := &pb.JoinRequest{
+		Address: s.address,
+		Avg:     s.avg,
+		Port:    int32(*port),
+		Version: s.version,
+	}
+	resp, err := (*client).Join(context.Background(), request)
+	if err != nil {
+		log.Printf("There is an error %v", err)
+		return
+	}
+	if s.address != resp.GetAddress() {
+		s.address = resp.GetAddress()
+	}
+}
+
+func (s *knnServiceServer) callExchangeServices(client *pb.KnnServiceClient) {
+	outputServiceList := make([]string, 0)
+	s.services.Range(func(key, value interface{}) bool {
+		serviceName := key.(string)
+		outputServiceList = append(outputServiceList, serviceName)
+		return true
+	})
+	request := &pb.ServiceMessage{
+		Services: outputServiceList,
+	}
+	resp, err := (*client).ExchangeServices(context.Background(), request)
+	if err != nil {
+		log.Printf("There is an error %v", err)
+		return
+	}
+	inputServiceList := resp.GetServices()
+	for i := 0; i < len(inputServiceList); i++ {
+		s.services.Store(inputServiceList[i], true)
+	}
+	log.Printf("Services exhanged")
+}
+
+func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
+	outputPeerList := make([]*pb.Peer, 0)
+	s.peers.Range(func(key, value interface{}) bool {
+		// address := key.(string)
+		peer := value.(Peer)
+		peerProto := &pb.Peer{
+			Address: peer.address,
+			Version: peer.version,
+			Avg:     peer.avg,
+		}
+		outputPeerList = append(outputPeerList, peerProto)
+		return true
+	})
+
+	request := &pb.PeerMessage{
+		Peers: outputPeerList,
+	}
+	resp, err := (*client).ExchangePeers(context.Background(), request)
+	if err != nil {
+		log.Printf("There is an error %v", err)
+		return
+	}
+	inputPeerList := resp.GetPeers()
+	for i := 0; i < len(inputPeerList); i++ {
+		peer := Peer{
+			address: inputPeerList[i].GetAddress(),
+			version: inputPeerList[i].GetVersion(),
+			avg:     inputPeerList[i].GetAvg(),
+		}
+		s.peers.Store(inputPeerList[i].GetAddress(), peer)
+	}
+	log.Printf("Peers exhanged")
+}
+
+func (s *knnServiceServer) SyncJoin() {
+	log.Printf("Sync Join")
+	s.services.Range(func(key, value interface{}) bool {
+		serviceName := key.(string)
+		client, conn := s.getClient(serviceName)
+		s.callJoin(client)
+		conn.Close()
+		return true
+	})
+	log.Printf("Service loop Ended")
+	s.peers.Range(func(key, value interface{}) bool {
+		peerAddress := key.(string)
+		client, conn := s.getClient(peerAddress)
+		s.callJoin(client)
+		s.callExchangeServices(client)
+		s.callExchangePeers(client)
+		conn.Close()
+		return true
+	})
+	log.Printf("Peer loop Ended")
+}
+
 func (s *knnServiceServer) syncMapToTree() {
 	points := make([]kdtree.Point, 0)
 	s.pointsMap.Range(func(key, value interface{}) bool {
@@ -180,23 +349,15 @@ func (s *knnServiceServer) syncMapToTree() {
 }
 
 func newServer() *knnServiceServer {
-	/* p1 := NewEuclideanPointWithLabel(time.Now().Unix(), "p1", 0.0, 0.0, 0.0)
-	p2 := NewEuclideanPointWithLabel(time.Now().Unix(), "p2", 0.0, 0.0, 1.0)
-	p3 := NewEuclideanPointWithLabel(time.Now().Unix(), "p3", 0.0, 1.0, 0.0)
-	p4 := NewEuclideanPointWithLabel(time.Now().Unix(), "p4", 1.0, 0.0, 0.0)
-	points := make([]kdtree.Point, 0)
-	points = append(points, p1)
-	points = append(points, p2)
-	points = append(points, p3)
-	points = append(points, p4)
-	tree := kdtree.NewKDTree(points) */
 	s := &knnServiceServer{}
+	s.services.Store("localhost:10000", true)
 	return s
 }
 
 func callKnn(client pb.KnnServiceClient) {
+	id := ksuid.New()
 	request := &pb.KnnRequest{
-		Id:        "101",
+		Id:        id.String(),
 		Timestamp: 1233234,
 		Timeout:   5,
 		K:         3,
@@ -249,6 +410,8 @@ func (s *knnServiceServer) check() {
 		}
 		defer conn.Close()
 		client := pb.NewKnnServiceClient(conn)
+
+		s.SyncJoin()
 
 		callKnn(client)
 
