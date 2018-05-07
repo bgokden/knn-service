@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +24,8 @@ import (
 
 	pb "github.com/bgokden/knn-service/knnservice"
 	"github.com/segmentio/ksuid"
+
+	"github.com/gorilla/mux"
 )
 
 var (
@@ -68,6 +73,12 @@ type EuclideanPointKey struct {
 type EuclideanPointValue struct {
 	timestamp int64
 	label     string
+}
+
+type EuclideanPointJson struct {
+	Feature   []float64 `json:"feature"`
+	Timestamp int64     `json:"timestamp"`
+	Label     string    `json:"label"`
 }
 
 // Return the label
@@ -175,7 +186,7 @@ func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) 
 func (s *knnServiceServer) Join(ctx context.Context, in *pb.JoinRequest) (*pb.JoinResponse, error) {
 	p, _ := peer.FromContext(ctx)
 	address := strings.Split(p.Addr.String(), ":")[0] + ":" + strconv.FormatInt(int64(in.GetPort()), 10)
-	log.Printf("Peer Addr: %s", address)
+	// log.Printf("Peer Addr: %s", address)
 	peer := Peer{
 		address: address,
 		avg:     in.GetAvg(),
@@ -269,7 +280,7 @@ func (s *knnServiceServer) callExchangeServices(client *pb.KnnServiceClient) {
 	for i := 0; i < len(inputServiceList); i++ {
 		s.services.Store(inputServiceList[i], true)
 	}
-	log.Printf("Services exhanged")
+	// log.Printf("Services exhanged")
 }
 
 func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
@@ -303,11 +314,11 @@ func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
 		}
 		s.peers.Store(inputPeerList[i].GetAddress(), peer)
 	}
-	log.Printf("Peers exhanged")
+	// log.Printf("Peers exhanged")
 }
 
 func (s *knnServiceServer) SyncJoin() {
-	log.Printf("Sync Join")
+	// log.Printf("Sync Join")
 	s.services.Range(func(key, value interface{}) bool {
 		serviceName := key.(string)
 		client, conn := s.getClient(serviceName)
@@ -315,7 +326,7 @@ func (s *knnServiceServer) SyncJoin() {
 		conn.Close()
 		return true
 	})
-	log.Printf("Service loop Ended")
+	// log.Printf("Service loop Ended")
 	s.peers.Range(func(key, value interface{}) bool {
 		peerAddress := key.(string)
 		client, conn := s.getClient(peerAddress)
@@ -325,10 +336,12 @@ func (s *knnServiceServer) SyncJoin() {
 		conn.Close()
 		return true
 	})
-	log.Printf("Peer loop Ended")
+	// log.Printf("Peer loop Ended")
 }
 
 func (s *knnServiceServer) syncMapToTree() {
+	// sum := make([]float64, 0)
+	// count := 0
 	points := make([]kdtree.Point, 0)
 	s.pointsMap.Range(func(key, value interface{}) bool {
 		euclideanPointKey := key.(EuclideanPointKey)
@@ -409,20 +422,72 @@ func (s *knnServiceServer) check() {
 			log.Fatalf("fail to dial: %v", err)
 		}
 		defer conn.Close()
-		client := pb.NewKnnServiceClient(conn)
+		// client := pb.NewKnnServiceClient(conn)
 
 		s.SyncJoin()
 
-		callKnn(client)
+		// callKnn(client)
 
-		callInsert(client)
+		// callInsert(client)
 
 		s.syncMapToTree()
 
 		// do some job
-		log.Println(time.Now().UTC())
+		// log.Println(time.Now().UTC())
 		time.Sleep(1000 * time.Millisecond)
 	}
+}
+
+func GetHeath(w http.ResponseWriter, r *http.Request) {
+	// A very simple health check.
+	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+
+	// In the future we could report back on the status of our DB, or our cache
+	// (e.g. Redis) by performing a simple PING, and include them in the response.
+	io.WriteString(w, `{"alive": true}`)
+}
+
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	response, _ := json.Marshal(payload)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(response)
+}
+
+func (s *knnServiceServer) PostInsert(w http.ResponseWriter, r *http.Request) {
+	// params := mux.Vars(r)
+	// log.Println(r.Body)
+	var in EuclideanPointJson
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&in); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload")
+		return
+	}
+	defer r.Body.Close()
+	key := EuclideanPointKey{
+		timestamp: in.Timestamp,
+	}
+	copy(key.feature[:], in.Feature)
+	value := EuclideanPointValue{
+		timestamp: in.Timestamp,
+		label:     in.Label,
+	}
+	s.pointsMap.Store(key, value)
+}
+
+func (s *knnServiceServer) restApi() {
+	log.Println("Rest api stared")
+	router := mux.NewRouter()
+	router.HandleFunc("/", GetHeath).Methods("GET")
+	router.HandleFunc("/health", GetHeath).Methods("GET")
+	router.HandleFunc("/v1/insert", s.PostInsert).Methods("POST")
+	log.Fatal(http.ListenAndServe(":8000", router))
 }
 
 func main() {
@@ -449,6 +514,7 @@ func main() {
 	s := newServer()
 	pb.RegisterKnnServiceServer(grpcServer, s)
 	go s.check()
-	log.Println("Server started")
+	go s.restApi()
+	log.Println("Server started .")
 	grpcServer.Serve(lis)
 }
