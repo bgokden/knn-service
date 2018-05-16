@@ -56,6 +56,7 @@ message Peer {
   string version = 3;
   repeated double avg = 4;
   repeated double hist = 5;
+  int64 n = 6;
 }
 
 message PeerMessage {
@@ -68,6 +69,7 @@ message JoinRequest {
   repeated double avg = 3; // known avg
   string version = 4;
   repeated double hist = 5; // extra features
+  int64 n = 6;
 }
 
 message JoinResponse {

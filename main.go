@@ -35,6 +35,7 @@ var (
 	keyFile    = flag.String("key_file", "", "The TLS key file")
 	jsonDBFile = flag.String("json_db_file", "testdata/route_guide_db.json", "A json file containing a list of features")
 	port       = flag.Int("port", 10000, "The server port")
+	services   = flag.String("services", "", "Comma separated list of services")
 )
 
 const k = 300
@@ -44,6 +45,7 @@ type Peer struct {
 	version string
 	avg     []float64
 	hist    []float64
+	n       int64
 }
 
 type knnServiceServer struct {
@@ -216,9 +218,10 @@ func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.K
 		responseFeatures := make([]*pb.Feature, 0)
 		for i := 0; i < len(ans); i++ {
 			feature := &pb.Feature{
-				Feature:   ans[i].GetValues(),
-				Timestamp: ans[i].GetTimestamp(),
-				Label:     ans[i].GetLabel(),
+				Feature:    ans[i].GetValues(),
+				Timestamp:  ans[i].GetTimestamp(),
+				Label:      ans[i].GetLabel(),
+				Grouplabel: ans[i].GetGroupLabel(),
 			}
 			responseFeatures = append(responseFeatures, feature)
 		}
@@ -247,14 +250,16 @@ func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) 
 }
 
 func (s *knnServiceServer) Join(ctx context.Context, in *pb.JoinRequest) (*pb.JoinResponse, error) {
+	log.Printf("Join request received")
 	p, _ := peer.FromContext(ctx)
 	address := strings.Split(p.Addr.String(), ":")[0] + ":" + strconv.FormatInt(int64(in.GetPort()), 10)
-	// log.Printf("Peer Addr: %s", address)
+	log.Printf("Peer Addr: %s", address)
 	peer := Peer{
 		address: address,
 		avg:     in.GetAvg(),
 		version: in.GetVersion(),
 		hist:    in.GetHist(),
+		n:       in.GetN(),
 	}
 	s.peers.Store(address, peer)
 	return &pb.JoinResponse{Address: address}, nil
@@ -281,6 +286,7 @@ func (s *knnServiceServer) ExchangePeers(ctx context.Context, in *pb.PeerMessage
 			address: inputPeerList[i].GetAddress(),
 			version: inputPeerList[i].GetVersion(),
 			avg:     inputPeerList[i].GetAvg(),
+			hist:    inputPeerList[i].GetHist(),
 		}
 		s.peers.Store(inputPeerList[i].GetAddress(), peer)
 	}
@@ -316,10 +322,11 @@ func (s *knnServiceServer) callJoin(client *pb.KnnServiceClient) {
 		Port:    int32(*port),
 		Version: s.version,
 		Hist:    s.hist,
+		N:       s.n,
 	}
 	resp, err := (*client).Join(context.Background(), request)
 	if err != nil {
-		log.Printf("There is an error %v", err)
+		log.Printf("(Call Join) There is an error %v", err)
 		return
 	}
 	if s.address != resp.GetAddress() {
@@ -352,6 +359,17 @@ func (s *knnServiceServer) callExchangeServices(client *pb.KnnServiceClient) {
 func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *Peer) {
 	// need to check avg and hist differences ...
 	// chose datum
+	if s.n < peer.n {
+		log.Printf("Other peer should initiate exchange data %s", peer.address)
+		return
+	}
+	distanceAvg := euclideanDistance(s.avg, peer.avg)
+	distanceHist := euclideanDistance(s.hist, peer.hist)
+	log.Printf("distanceAvg %f, distanceHist: %f", distanceAvg, distanceHist)
+	if distanceAvg*0.01 < s.maxDistance {
+		log.Printf("Stop since avg are close enough")
+	}
+
 	count := 0
 	points := make([]kdtree.Point, 0)
 	s.pointsMap.Range(func(key, value interface{}) bool {
@@ -393,6 +411,7 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 }
 
 func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
+	log.Printf("callExchangePeers")
 	outputPeerList := make([]*pb.Peer, 0)
 	s.peers.Range(func(key, value interface{}) bool {
 		// address := key.(string)
@@ -401,11 +420,13 @@ func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
 			Address: peer.address,
 			Version: peer.version,
 			Avg:     peer.avg,
+			Hist:    peer.hist,
+			N:       peer.n,
 		}
 		outputPeerList = append(outputPeerList, peerProto)
 		return true
 	})
-
+	log.Print(outputPeerList)
 	request := &pb.PeerMessage{
 		Peers: outputPeerList,
 	}
@@ -416,12 +437,18 @@ func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
 	}
 	inputPeerList := resp.GetPeers()
 	for i := 0; i < len(inputPeerList); i++ {
+		// temp, _ := s.peers.Load(inputPeerList[i].GetAddress())
+		// oldPeer := temp.(Peer)
 		peer := Peer{
 			address: inputPeerList[i].GetAddress(),
 			version: inputPeerList[i].GetVersion(),
 			avg:     inputPeerList[i].GetAvg(),
+			hist:    inputPeerList[i].GetHist(),
+			n:       inputPeerList[i].GetN(),
 		}
-		s.peers.Store(inputPeerList[i].GetAddress(), peer)
+		if s.address != peer.address {
+			s.peers.Store(inputPeerList[i].GetAddress(), peer)
+		}
 	}
 	// log.Printf("Peers exhanged")
 }
@@ -430,15 +457,19 @@ func (s *knnServiceServer) SyncJoin() {
 	// log.Printf("Sync Join")
 	s.services.Range(func(key, value interface{}) bool {
 		serviceName := key.(string)
-		client, conn := s.getClient(serviceName)
-		s.callJoin(client)
-		conn.Close()
+		log.Printf("Service %s", serviceName)
+		if len(serviceName) > 0 {
+			client, conn := s.getClient(serviceName)
+			s.callJoin(client)
+			conn.Close()
+		}
 		return true
 	})
-	// log.Printf("Service loop Ended")
+	log.Printf("Service loop Ended")
 	s.peers.Range(func(key, value interface{}) bool {
 		peerAddress := key.(string)
-		if peerAddress != s.address {
+		log.Printf("Peer %s", peerAddress)
+		if len(peerAddress) > 0 && peerAddress != s.address {
 			peerValue := value.(Peer)
 			client, conn := s.getClient(peerAddress)
 			s.callJoin(client)
@@ -449,7 +480,7 @@ func (s *knnServiceServer) SyncJoin() {
 		}
 		return true
 	})
-	// log.Printf("Peer loop Ended")
+	log.Printf("Peer loop Ended")
 }
 
 func (s *knnServiceServer) syncMapToTree() {
@@ -509,7 +540,13 @@ func (s *knnServiceServer) syncMapToTree() {
 
 func newServer() *knnServiceServer {
 	s := &knnServiceServer{}
-	s.services.Store("localhost:10000", true)
+	log.Printf("services %s", *services)
+	serviceList := strings.Split(*services, ",")
+	for _, service := range serviceList {
+		if len(service) > 0 {
+			s.services.Store(service, true)
+		}
+	}
 	s.maxMemoryMiB = 1024
 	return s
 }
@@ -697,7 +734,7 @@ func (s *knnServiceServer) restApi() {
 
 func main() {
 	flag.Parse()
-	lis, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
+	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
