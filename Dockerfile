@@ -10,3 +10,5 @@ FROM alpine
 WORKDIR /app
 COPY --from=build-env /go/src/app/goapp /app/
 ENTRYPOINT ./goapp
+
+EXPOSE 8000 10000

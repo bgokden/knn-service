@@ -27,6 +27,7 @@ message Feature {
   repeated double feature = 1;
   int64 timestamp = 2;
   string label = 3;
+  string grouplabel = 4;
 }
 
 message KnnResponse {
@@ -35,14 +36,13 @@ message KnnResponse {
 }
 
 message InsertionRequest {
-  string id = 1;
   int64 timestamp = 2;
   string label = 3;
-  repeated double feature = 4;
+  string grouplabel = 4;
+  repeated double feature = 5;
 }
 
 message InsertionResponse {
-  string id = 1;
   int32 code = 2;
 }
 
@@ -55,7 +55,7 @@ message Peer {
   int64 timestamp = 2;
   string version = 3;
   repeated double avg = 4;
-  repeated double feature = 5;
+  repeated double hist = 5;
 }
 
 message PeerMessage {
@@ -67,7 +67,7 @@ message JoinRequest {
   int32 port = 2;
   repeated double avg = 3; // known avg
   string version = 4;
-  repeated double feature = 5; // extra features
+  repeated double hist = 5; // extra features
 }
 
 message JoinResponse {
