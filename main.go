@@ -41,11 +41,12 @@ var (
 const k = 300
 
 type Peer struct {
-	address string
-	version string
-	avg     []float64
-	hist    []float64
-	n       int64
+	address   string
+	version   string
+	avg       []float64
+	hist      []float64
+	n         int64
+	timestamp int64
 }
 
 type knnServiceServer struct {
@@ -56,6 +57,7 @@ type knnServiceServer struct {
 	hist                  []float64
 	address               string
 	version               string
+	timestamp             int64
 	dirty                 bool
 	latestNumberOfInserts int
 	state                 int
@@ -126,7 +128,7 @@ func (p *EuclideanPoint) GetTimestamp() int64 {
 
 func euclideanDistance(arr1 []float64, arr2 []float64) float64 {
 	if len(arr1) != len(arr2) {
-		log.Printf("Something is very wrong")
+		// log.Printf("Something is very wrong")
 		return 0
 	}
 	var ret float64
@@ -250,16 +252,17 @@ func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) 
 }
 
 func (s *knnServiceServer) Join(ctx context.Context, in *pb.JoinRequest) (*pb.JoinResponse, error) {
-	log.Printf("Join request received")
+	// log.Printf("Join request received %v", *in)
 	p, _ := peer.FromContext(ctx)
 	address := strings.Split(p.Addr.String(), ":")[0] + ":" + strconv.FormatInt(int64(in.GetPort()), 10)
-	log.Printf("Peer Addr: %s", address)
+	// log.Printf("Peer Addr: %s", address)
 	peer := Peer{
-		address: address,
-		avg:     in.GetAvg(),
-		version: in.GetVersion(),
-		hist:    in.GetHist(),
-		n:       in.GetN(),
+		address:   address,
+		avg:       in.GetAvg(),
+		version:   in.GetVersion(),
+		hist:      in.GetHist(),
+		n:         in.GetN(),
+		timestamp: in.GetTimestamp(),
 	}
 	s.peers.Store(address, peer)
 	return &pb.JoinResponse{Address: address}, nil
@@ -282,23 +285,37 @@ func (s *knnServiceServer) ExchangeServices(ctx context.Context, in *pb.ServiceM
 func (s *knnServiceServer) ExchangePeers(ctx context.Context, in *pb.PeerMessage) (*pb.PeerMessage, error) {
 	inputPeerList := in.GetPeers()
 	for i := 0; i < len(inputPeerList); i++ {
-		peer := Peer{
-			address: inputPeerList[i].GetAddress(),
-			version: inputPeerList[i].GetVersion(),
-			avg:     inputPeerList[i].GetAvg(),
-			hist:    inputPeerList[i].GetHist(),
+		insert := true
+		temp, ok := s.peers.Load(inputPeerList[i].GetAddress())
+		if ok {
+			peerOld := temp.(Peer)
+			if peerOld.timestamp > inputPeerList[i].GetTimestamp() {
+				insert = false
+			}
 		}
-		s.peers.Store(inputPeerList[i].GetAddress(), peer)
+		if insert {
+			peer := Peer{
+				address:   inputPeerList[i].GetAddress(),
+				version:   inputPeerList[i].GetVersion(),
+				avg:       inputPeerList[i].GetAvg(),
+				hist:      inputPeerList[i].GetHist(),
+				n:         inputPeerList[i].GetN(),
+				timestamp: inputPeerList[i].GetTimestamp(),
+			}
+			s.peers.Store(inputPeerList[i].GetAddress(), peer)
+		}
 	}
 	outputPeerList := make([]*pb.Peer, 0)
 	s.peers.Range(func(key, value interface{}) bool {
 		// address := key.(string)
 		peer := value.(Peer)
 		peerProto := &pb.Peer{
-			Address: peer.address,
-			Version: peer.version,
-			Avg:     peer.avg,
-			Hist:    peer.hist,
+			Address:   peer.address,
+			Version:   peer.version,
+			Avg:       peer.avg,
+			Hist:      peer.hist,
+			N:         peer.n,
+			Timestamp: peer.timestamp,
 		}
 		outputPeerList = append(outputPeerList, peerProto)
 		return true
@@ -317,13 +334,15 @@ func (s *knnServiceServer) getClient(address string) (*pb.KnnServiceClient, *grp
 
 func (s *knnServiceServer) callJoin(client *pb.KnnServiceClient) {
 	request := &pb.JoinRequest{
-		Address: s.address,
-		Avg:     s.avg,
-		Port:    int32(*port),
-		Version: s.version,
-		Hist:    s.hist,
-		N:       s.n,
+		Address:   s.address,
+		Avg:       s.avg,
+		Port:      int32(*port),
+		Version:   s.version,
+		Hist:      s.hist,
+		N:         s.n,
+		Timestamp: s.timestamp,
 	}
+	// log.Printf("Call Join Request %v", *request)
 	resp, err := (*client).Join(context.Background(), request)
 	if err != nil {
 		log.Printf("(Call Join) There is an error %v", err)
@@ -359,17 +378,33 @@ func (s *knnServiceServer) callExchangeServices(client *pb.KnnServiceClient) {
 func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *Peer) {
 	// need to check avg and hist differences ...
 	// chose datum
+	log.Printf("s.n: %d   peer.n: %d", s.n, peer.n)
+	if peer.timestamp+30 > time.Now().Unix() {
+		log.Printf("Peer data is too old. %s", peer.address)
+		return
+	}
 	if s.n < peer.n {
 		log.Printf("Other peer should initiate exchange data %s", peer.address)
 		return
 	}
 	distanceAvg := euclideanDistance(s.avg, peer.avg)
 	distanceHist := euclideanDistance(s.hist, peer.hist)
-	log.Printf("distanceAvg %f, distanceHist: %f", distanceAvg, distanceHist)
-	if distanceAvg*0.01 < s.maxDistance {
-		log.Printf("Stop since avg are close enough")
+	log.Printf("%s => distanceAvg %f, distanceHist: %f", peer.address, distanceAvg, distanceHist)
+	limit := int(((s.n - peer.n) / 2) % 1000)
+	nRatio := 0.0
+	if peer.n != 0 {
+		nRatio = float64(s.n) / float64(peer.n)
 	}
-
+	if 0.99 < nRatio && nRatio < 1.01 && distanceAvg < 0.0005 && distanceHist < 0.0005 && s.state == 0 {
+		log.Printf("Decrease number of changes to 1 since stats are close enough %s", peer.address)
+		limit = 1 // no change can be risky
+	}
+	/*
+		  if distanceAvg < s.maxDistance*0.00001 {
+				log.Printf("Decrease number of changes since avg are close enough")
+				limit = 10
+			}
+	*/
 	count := 0
 	points := make([]kdtree.Point, 0)
 	s.pointsMap.Range(func(key, value interface{}) bool {
@@ -380,14 +415,14 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 			euclideanPointKey.timestamp,
 			euclideanPointValue.label,
 			euclideanPointValue.groupLabel)
-		if count <= 100 {
+		if count <= limit {
 			points = append(points, point)
 		}
 		count++
 		return true
 	})
 
-	for i, point := range points {
+	for _, point := range points {
 		request := &pb.InsertionRequest{
 			Timestamp:  point.GetTimestamp(),
 			Label:      point.GetLabel(),
@@ -398,13 +433,14 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 		if err != nil {
 			log.Printf("There is an error: %v", err)
 		} else {
-			log.Printf("A new Response has been received for %d. with code: %d", i, resp.GetCode())
+			// log.Printf("A new Response has been received for %d. with code: %d", i, resp.GetCode())
 			if resp.GetCode() == 0 && s.state > 0 {
 				key := EuclideanPointKey{
 					timestamp: point.GetTimestamp(),
 				}
 				copy(key.feature[:], point.GetValues())
 				s.pointsMap.Delete(key)
+				s.dirty = true
 			}
 		}
 	}
@@ -417,16 +453,16 @@ func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
 		// address := key.(string)
 		peer := value.(Peer)
 		peerProto := &pb.Peer{
-			Address: peer.address,
-			Version: peer.version,
-			Avg:     peer.avg,
-			Hist:    peer.hist,
-			N:       peer.n,
+			Address:   peer.address,
+			Version:   peer.version,
+			Avg:       peer.avg,
+			Hist:      peer.hist,
+			N:         peer.n,
+			Timestamp: peer.timestamp,
 		}
 		outputPeerList = append(outputPeerList, peerProto)
 		return true
 	})
-	log.Print(outputPeerList)
 	request := &pb.PeerMessage{
 		Peers: outputPeerList,
 	}
@@ -437,16 +473,23 @@ func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
 	}
 	inputPeerList := resp.GetPeers()
 	for i := 0; i < len(inputPeerList); i++ {
-		// temp, _ := s.peers.Load(inputPeerList[i].GetAddress())
-		// oldPeer := temp.(Peer)
-		peer := Peer{
-			address: inputPeerList[i].GetAddress(),
-			version: inputPeerList[i].GetVersion(),
-			avg:     inputPeerList[i].GetAvg(),
-			hist:    inputPeerList[i].GetHist(),
-			n:       inputPeerList[i].GetN(),
+		insert := true
+		temp, ok := s.peers.Load(inputPeerList[i].GetAddress())
+		if ok {
+			peerOld := temp.(Peer)
+			if peerOld.timestamp > inputPeerList[i].GetTimestamp() {
+				insert = false
+			}
 		}
-		if s.address != peer.address {
+		if insert && s.address != inputPeerList[i].GetAddress() {
+			peer := Peer{
+				address:   inputPeerList[i].GetAddress(),
+				version:   inputPeerList[i].GetVersion(),
+				avg:       inputPeerList[i].GetAvg(),
+				hist:      inputPeerList[i].GetHist(),
+				n:         inputPeerList[i].GetN(),
+				timestamp: inputPeerList[i].GetTimestamp(),
+			}
 			s.peers.Store(inputPeerList[i].GetAddress(), peer)
 		}
 	}
@@ -521,14 +564,16 @@ func (s *knnServiceServer) syncMapToTree() {
 			return true
 		})
 		log.Printf("Max Distance %f", maxDistance)
-		log.Printf("hist")
-		log.Print(hist)
-		log.Printf("avg")
-		log.Print(avg)
+		// log.Printf("hist")
+		// log.Print(hist)
+		// log.Printf("avg")
+		// log.Print(avg)
 		s.avg = avg
 		s.hist = hist
 		s.maxDistance = maxDistance
 		s.n = n
+		s.timestamp = time.Now().Unix()
+		s.latestNumberOfInserts = 0
 		if len(points) > 0 {
 			tree := kdtree.NewKDTree(points)
 			s.treeMu.Lock()
@@ -591,51 +636,53 @@ func callInsert(client pb.KnnServiceClient) {
 	if err != nil {
 		log.Fatalf("There is an error: %v", err)
 	}
-	// if resp.Success {
-	log.Printf("A new Response has been received with code: %d", resp.Code)
-	// }
+	if resp.Code != 0 {
+		log.Printf("A new Response has been received with code: %d", resp.Code)
+	}
 }
 
 func (s *knnServiceServer) check() {
+	nextSyncJoinTime := time.Now().Unix()
+	nextSyncMapTime := time.Now().Unix()
 	for {
-		// var opts []grpc.DialOption
-		// var serverAddr string = "localhost:10000"
-		// conn, err := grpc.Dial("localhost:10000", grpc.WithInsecure())
-		// if err != nil {
-		// 	log.Fatalf("fail to dial: %v", err)
-		// }
-		// defer conn.Close()
-		// client := pb.NewKnnServiceClient(conn)
-
-		s.SyncJoin()
-
-		// callKnn(client)
-
-		// callInsert(client)
-
-		s.syncMapToTree()
-
-		// do some job
-		// log.Println(time.Now().UTC())
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
-		log.Printf("Alloc = %v MiB", bToMb(m.Alloc))
-		log.Printf("TotalAlloc = %v MiB", bToMb(m.TotalAlloc))
-		log.Printf("Sys = %v MiB", bToMb(m.Sys))
-		log.Printf("NumGC = %v\n", m.NumGC)
-		currentMemory := float64(bToMb(m.Sys))
+		// log.Printf("Alloc = %v MiB", bToMb(m.Alloc))
+		// log.Printf("TotalAlloc = %v MiB", bToMb(m.TotalAlloc))
+		// log.Printf("Sys = %v MiB", bToMb(m.Sys))
+		// log.Printf("NumGC = %v\n", m.NumGC)
+		currentMemory := float64(bToMb(m.Alloc))
 		maxMemory := float64(s.maxMemoryMiB)
-		if currentMemory < maxMemory*0.8 {
+		if currentMemory < maxMemory*0.5 {
 			s.state = 0 // Accept insert, don't delete while sending data
-		} else if currentMemory < maxMemory*0.9 {
+		} else if currentMemory < maxMemory*0.85 {
 			s.state = 1 // Accept insert, delete while sending data
 		} else {
 			s.state = 2 // Don't accept insert, delete while sending data
 		}
-		millisecondToSleep := ((s.latestNumberOfInserts + 100) % 10000) * 10
-		log.Printf("millisecondToSleep: %d, len %d", millisecondToSleep, s.n)
-		s.latestNumberOfInserts = 0
-		time.Sleep(time.Duration(millisecondToSleep) * time.Millisecond)
+		log.Printf("Current Memory = %f MiB => current State %d", currentMemory, s.state)
+		// millisecondToSleep := int64(((s.latestNumberOfInserts + 100) % 1000) * 10)
+		// log.Printf("millisecondToSleep: %d, len %d", millisecondToSleep, s.n)
+		// time.Sleep(time.Duration(millisecondToSleep) * time.Millisecond)
+
+		currentTime := time.Now().Unix()
+		log.Printf("Current Time: %v", currentTime)
+		if nextSyncJoinTime <= currentTime {
+			s.SyncJoin()
+			nextSyncJoinTime = time.Now().Unix() + 1
+		}
+
+		if nextSyncMapTime <= currentTime {
+			secondsToSleep := int64((s.latestNumberOfInserts + 1) % 60)
+			s.syncMapToTree()
+			nextSyncMapTime = time.Now().Unix() + secondsToSleep
+		}
+
+		time.Sleep(time.Duration(1000) * time.Millisecond) // always wait one second
+
+		// do some job
+		// log.Println(time.Now().UTC())
+
 	}
 }
 

@@ -70,6 +70,7 @@ message JoinRequest {
   string version = 4;
   repeated double hist = 5; // extra features
   int64 n = 6;
+  int64 timestamp = 7;
 }
 
 message JoinResponse {
