@@ -197,6 +197,10 @@ func equal(p1 kdtree.Point, p2 kdtree.Point) bool {
 	return true
 }
 
+func getCurrentTime() int64 {
+	return time.Now().Unix()
+}
+
 func calculateAverage(avg []float64, p kdtree.Point, n float64) []float64 {
 	if n == 0 {
 		return p.GetValues()
@@ -379,8 +383,14 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 	// need to check avg and hist differences ...
 	// chose datum
 	log.Printf("s.n: %d   peer.n: %d", s.n, peer.n)
-	if peer.timestamp+30 > time.Now().Unix() {
-		log.Printf("Peer data is too old. %s", peer.address)
+	if peer.timestamp+360 < getCurrentTime() {
+		log.Printf("Peer data is too old, maybe peer is dead: %s, peer timestamp: %d, current time: %d", peer.address, peer.timestamp, getCurrentTime())
+		// Maybe remove the peer here
+		return
+	}
+	if peer.timestamp+30 < getCurrentTime() && s.state == 0 {
+		log.Printf("Peer data is too old: %s", peer.address)
+		// limit = 1 // no change can be risky
 		return
 	}
 	if s.n < peer.n {
@@ -390,7 +400,7 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 	distanceAvg := euclideanDistance(s.avg, peer.avg)
 	distanceHist := euclideanDistance(s.hist, peer.hist)
 	log.Printf("%s => distanceAvg %f, distanceHist: %f", peer.address, distanceAvg, distanceHist)
-	limit := int(((s.n - peer.n) / 2) % 1000)
+	limit := int(((s.n - peer.n) / 10) % 1000)
 	nRatio := 0.0
 	if peer.n != 0 {
 		nRatio = float64(s.n) / float64(peer.n)
@@ -399,12 +409,6 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 		log.Printf("Decrease number of changes to 1 since stats are close enough %s", peer.address)
 		limit = 1 // no change can be risky
 	}
-	/*
-		  if distanceAvg < s.maxDistance*0.00001 {
-				log.Printf("Decrease number of changes since avg are close enough")
-				limit = 10
-			}
-	*/
 	count := 0
 	points := make([]kdtree.Point, 0)
 	s.pointsMap.Range(func(key, value interface{}) bool {
@@ -572,7 +576,7 @@ func (s *knnServiceServer) syncMapToTree() {
 		s.hist = hist
 		s.maxDistance = maxDistance
 		s.n = n
-		s.timestamp = time.Now().Unix()
+		s.timestamp = getCurrentTime()
 		s.latestNumberOfInserts = 0
 		if len(points) > 0 {
 			tree := kdtree.NewKDTree(points)
@@ -581,6 +585,7 @@ func (s *knnServiceServer) syncMapToTree() {
 			s.treeMu.Unlock()
 		}
 	}
+	s.timestamp = getCurrentTime() // update always
 }
 
 func newServer() *knnServiceServer {
@@ -624,7 +629,7 @@ func callKnn(client pb.KnnServiceClient) {
 
 func callInsert(client pb.KnnServiceClient) {
 	request := &pb.InsertionRequest{
-		Timestamp: time.Now().Unix(),
+		Timestamp: getCurrentTime(),
 		Label:     "po" + strconv.FormatInt(int64(rand.Intn(100)), 10),
 		Feature: []float64{
 			rand.Float64(),
@@ -642,8 +647,8 @@ func callInsert(client pb.KnnServiceClient) {
 }
 
 func (s *knnServiceServer) check() {
-	nextSyncJoinTime := time.Now().Unix()
-	nextSyncMapTime := time.Now().Unix()
+	nextSyncJoinTime := getCurrentTime()
+	nextSyncMapTime := getCurrentTime()
 	for {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
@@ -665,19 +670,18 @@ func (s *knnServiceServer) check() {
 		// log.Printf("millisecondToSleep: %d, len %d", millisecondToSleep, s.n)
 		// time.Sleep(time.Duration(millisecondToSleep) * time.Millisecond)
 
-		currentTime := time.Now().Unix()
+		currentTime := getCurrentTime()
 		log.Printf("Current Time: %v", currentTime)
-		if nextSyncJoinTime <= currentTime {
+		if nextSyncJoinTime <= getCurrentTime() {
 			s.SyncJoin()
-			nextSyncJoinTime = time.Now().Unix() + 1
+			nextSyncJoinTime = getCurrentTime() + 1
 		}
 
-		if nextSyncMapTime <= currentTime {
+		if nextSyncMapTime <= getCurrentTime() {
 			secondsToSleep := int64((s.latestNumberOfInserts + 1) % 60)
 			s.syncMapToTree()
-			nextSyncMapTime = time.Now().Unix() + secondsToSleep
+			nextSyncMapTime = getCurrentTime() + secondsToSleep
 		}
-
 		time.Sleep(time.Duration(1000) * time.Millisecond) // always wait one second
 
 		// do some job
