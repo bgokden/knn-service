@@ -236,14 +236,20 @@ func (s *knnServiceServer) GetKnnFromPeer(in *pb.KnnRequest, peer *Peer, feature
 
 func (s *knnServiceServer) GetKnnFromPeers(in *pb.KnnRequest, featuresChannel chan<- pb.Feature) {
 	timeout := int64(float64(in.GetTimeout()) / 2.0)
-	in.Timeout = timeout
+	request := &pb.KnnRequest{
+		Feature:   in.GetFeature(),
+		Id:        in.GetId(),
+		K:         in.GetK(),
+		Timestamp: in.GetTimestamp(),
+		Timeout:   timeout,
+	}
 	log.Printf("GetKnnFromPeers")
 	s.peers.Range(func(key, value interface{}) bool {
 		peerAddress := key.(string)
 		log.Printf("Peer %s", peerAddress)
 		if len(peerAddress) > 0 && peerAddress != s.address {
 			peerValue := value.(Peer)
-			s.GetKnnFromPeer(in, &peerValue, featuresChannel)
+			s.GetKnnFromPeer(request, &peerValue, featuresChannel)
 		}
 		return true
 	})
@@ -288,20 +294,52 @@ func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.K
 	responseFeatures := make([]*pb.Feature, 0)
 	dataAvailable := true
 	timeLimit := time.After(time.Duration(in.GetTimeout()) * time.Millisecond)
+	reduceMap := make(map[EuclideanPointKey]EuclideanPointValue)
 	for dataAvailable {
 		select {
 		case feature := <-featuresChannel:
-			log.Printf("New Feature (Get Knn): %v", feature.GetLabel())
-			responseFeatures = append(responseFeatures, &feature)
+			key := EuclideanPointKey{
+				timestamp: feature.Timestamp,
+			}
+			copy(key.feature[:], feature.Feature)
+			value := EuclideanPointValue{
+				timestamp:  feature.Timestamp,
+				label:      feature.Label,
+				groupLabel: feature.Grouplabel,
+			}
+			reduceMap[key] = value
 		case <-timeLimit:
-			log.Printf("timeout 2")
+			log.Printf("timeout")
 			dataAvailable = false
 			break
 		}
 	}
-	/*
-	  create a new map and run kdtree search again
-	*/
+	if len(reduceMap) > 0 {
+		points := make([]kdtree.Point, 0)
+		for euclideanPointKey, euclideanPointValue := range reduceMap {
+			log.Printf("Received Feature (Get KNN): %v", euclideanPointValue.label)
+			point := NewEuclideanPointArrWithLabel(
+				euclideanPointKey.feature,
+				euclideanPointKey.timestamp,
+				euclideanPointValue.label,
+				euclideanPointValue.groupLabel)
+			points = append(points, point)
+		}
+		tree := kdtree.NewKDTree(points)
+		point := NewEuclideanPointArr(in.Feature)
+		// log.Printf("len(points): %d, in.K:%d", len(points), int(in.K))
+		ans := tree.KNN(point, int(in.K))
+		for i := 0; i < len(ans); i++ {
+			featureJson := &pb.Feature{
+				Feature:    ans[i].GetValues(),
+				Timestamp:  ans[i].GetTimestamp(),
+				Label:      ans[i].GetLabel(),
+				Grouplabel: ans[i].GetGroupLabel(),
+			}
+			log.Printf("New Feature (Get Knn): %v", ans[i].GetLabel())
+			responseFeatures = append(responseFeatures, featureJson)
+		}
+	}
 	return &pb.KnnResponse{Id: request.GetId(), Features: responseFeatures}, nil
 }
 
@@ -784,21 +822,49 @@ func (s *knnServiceServer) PostSearch(w http.ResponseWriter, r *http.Request) {
 	responseFeatures := make([]EuclideanPointJson, 0)
 	dataAvailable := true
 	timeLimit := time.After(time.Duration(in.Timeout) * time.Millisecond)
+	reduceMap := make(map[EuclideanPointKey]EuclideanPointValue)
 	for dataAvailable {
 		select {
 		case feature := <-featuresChannel:
-			featureJson := EuclideanPointJson{
-				Feature:    feature.Feature,
-				Timestamp:  feature.Timestamp,
-				Label:      feature.Label,
-				GroupLabel: feature.Grouplabel,
+			key := EuclideanPointKey{
+				timestamp: feature.Timestamp,
 			}
-			log.Printf("New Feature (PostSearch): %v", feature.GetLabel())
-			responseFeatures = append(responseFeatures, featureJson)
+			copy(key.feature[:], feature.Feature)
+			value := EuclideanPointValue{
+				timestamp:  feature.Timestamp,
+				label:      feature.Label,
+				groupLabel: feature.Grouplabel,
+			}
+			reduceMap[key] = value
 		case <-timeLimit:
 			log.Printf("timeout PostSearch")
 			dataAvailable = false
 			break
+		}
+	}
+	if len(reduceMap) > 0 {
+		points := make([]kdtree.Point, 0)
+		for euclideanPointKey, euclideanPointValue := range reduceMap {
+			log.Printf("Received Feature (PostSearch): %v", euclideanPointValue.label)
+			point := NewEuclideanPointArrWithLabel(
+				euclideanPointKey.feature,
+				euclideanPointKey.timestamp,
+				euclideanPointValue.label,
+				euclideanPointValue.groupLabel)
+			points = append(points, point)
+		}
+		tree := kdtree.NewKDTree(points)
+		point := NewEuclideanPointArr(in.Feature)
+		ans := tree.KNN(point, int(in.K))
+		for i := 0; i < len(ans); i++ {
+			featureJson := EuclideanPointJson{
+				Feature:    ans[i].GetValues(),
+				Timestamp:  ans[i].GetTimestamp(),
+				Label:      ans[i].GetLabel(),
+				GroupLabel: ans[i].GetGroupLabel(),
+			}
+			log.Printf("New Feature (PostSearch): %v", ans[i].GetLabel())
+			responseFeatures = append(responseFeatures, featureJson)
 		}
 	}
 	respondWithJSON(w, http.StatusOK, SearchResultJson{Points: responseFeatures})
