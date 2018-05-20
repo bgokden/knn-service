@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"runtime"
@@ -65,10 +64,11 @@ type knnServiceServer struct {
 	pointsMap             sync.Map
 	services              sync.Map
 	peers                 sync.Map
-	pointsMu              sync.RWMutex   // protects points
-	points                []kdtree.Point // read-only after initialized
-	treeMu                sync.RWMutex   // protects KDTree
-	tree                  *kdtree.KDTree
+	knnQueryId            sync.Map
+	pointsMu              sync.RWMutex // protects points
+	// points                []kdtree.Point // read-only after initialized
+	treeMu sync.RWMutex // protects KDTree
+	tree   *kdtree.KDTree
 }
 
 type EuclideanPoint struct {
@@ -214,14 +214,48 @@ func calculateAverage(avg []float64, p kdtree.Point, n float64) []float64 {
 	return avg
 }
 
-// CreateCustomer creates a new Customer
-func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.KnnResponse, error) {
+func (s *knnServiceServer) GetKnnFromPeer(in *pb.KnnRequest, peer *Peer, featuresChannel chan<- pb.Feature) {
+	log.Printf("GetKnnFromPeer %s", peer.address)
+	client, conn := s.getClient(peer.address)
+	resp, err := (*client).GetKnn(context.Background(), in)
+	if err != nil {
+		log.Printf("There is an error: %v", err)
+		conn.Close()
+		return
+	}
+	// if resp.Success {
+	// log.Printf("A new Response has been received with id: %s", resp.Id)
+	features := resp.GetFeatures()
+	for i := 0; i < len(features); i++ {
+		log.Printf("New Feature from Peer (%s) : %v", peer.address, features[i].GetLabel())
+		featuresChannel <- *(features[i])
+		// log.Println(features[i].GetLabel())
+	}
+	conn.Close()
+}
+
+func (s *knnServiceServer) GetKnnFromPeers(in *pb.KnnRequest, featuresChannel chan<- pb.Feature) {
+	timeout := int64(float64(in.GetTimeout()) / 2.0)
+	in.Timeout = timeout
+	log.Printf("GetKnnFromPeers")
+	s.peers.Range(func(key, value interface{}) bool {
+		peerAddress := key.(string)
+		log.Printf("Peer %s", peerAddress)
+		if len(peerAddress) > 0 && peerAddress != s.address {
+			peerValue := value.(Peer)
+			s.GetKnnFromPeer(in, &peerValue, featuresChannel)
+		}
+		return true
+	})
+}
+
+func (s *knnServiceServer) GetKnnFromLocal(in *pb.KnnRequest, featuresChannel chan<- pb.Feature) {
+	log.Printf("GetKnnFromLocal")
 	point := NewEuclideanPointArr(in.GetFeature())
 	if s.tree != nil {
 		s.treeMu.RLock()
 		ans := s.tree.KNN(point, int(in.GetK()))
 		s.treeMu.RUnlock()
-		responseFeatures := make([]*pb.Feature, 0)
 		for i := 0; i < len(ans); i++ {
 			feature := &pb.Feature{
 				Feature:    ans[i].GetValues(),
@@ -229,11 +263,46 @@ func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.K
 				Label:      ans[i].GetLabel(),
 				Grouplabel: ans[i].GetGroupLabel(),
 			}
-			responseFeatures = append(responseFeatures, feature)
+			log.Printf("New Feature from Local: %v", feature.GetLabel())
+			featuresChannel <- *feature
 		}
-		return &pb.KnnResponse{Id: in.Id, Features: responseFeatures}, nil
 	}
-	return &pb.KnnResponse{Id: in.Id, Features: nil}, nil
+}
+
+// CreateCustomer creates a new Customer
+func (s *knnServiceServer) GetKnn(ctx context.Context, in *pb.KnnRequest) (*pb.KnnResponse, error) {
+	request := *in
+	if len(in.GetId()) == 0 {
+		request.Id = ksuid.New().String()
+	} else {
+		_, loaded := s.knnQueryId.LoadOrStore(request.GetId(), getCurrentTime())
+		if loaded {
+			return &pb.KnnResponse{Id: in.Id, Features: nil}, nil
+		}
+	}
+	featuresChannel := make(chan pb.Feature, in.GetK())
+	go s.GetKnnFromPeers(&request, featuresChannel)
+	go s.GetKnnFromLocal(&request, featuresChannel)
+	// time.Sleep(1 * time.Second)
+	// close(featuresChannel)
+	responseFeatures := make([]*pb.Feature, 0)
+	dataAvailable := true
+	timeLimit := time.After(time.Duration(in.GetTimeout()) * time.Millisecond)
+	for dataAvailable {
+		select {
+		case feature := <-featuresChannel:
+			log.Printf("New Feature (Get Knn): %v", feature.GetLabel())
+			responseFeatures = append(responseFeatures, &feature)
+		case <-timeLimit:
+			log.Printf("timeout 2")
+			dataAvailable = false
+			break
+		}
+	}
+	/*
+	  create a new map and run kdtree search again
+	*/
+	return &pb.KnnResponse{Id: request.GetId(), Features: responseFeatures}, nil
 }
 
 func (s *knnServiceServer) Insert(ctx context.Context, in *pb.InsertionRequest) (*pb.InsertionResponse, error) {
@@ -382,31 +451,31 @@ func (s *knnServiceServer) callExchangeServices(client *pb.KnnServiceClient) {
 func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *Peer) {
 	// need to check avg and hist differences ...
 	// chose datum
-	log.Printf("s.n: %d   peer.n: %d", s.n, peer.n)
+	// log.Printf("s.n: %d   peer.n: %d", s.n, peer.n)
 	if peer.timestamp+360 < getCurrentTime() {
 		log.Printf("Peer data is too old, maybe peer is dead: %s, peer timestamp: %d, current time: %d", peer.address, peer.timestamp, getCurrentTime())
 		// Maybe remove the peer here
 		return
 	}
 	if peer.timestamp+30 < getCurrentTime() && s.state == 0 {
-		log.Printf("Peer data is too old: %s", peer.address)
+		// log.Printf("Peer data is too old: %s", peer.address)
 		// limit = 1 // no change can be risky
 		return
 	}
 	if s.n < peer.n {
-		log.Printf("Other peer should initiate exchange data %s", peer.address)
+		// log.Printf("Other peer should initiate exchange data %s", peer.address)
 		return
 	}
 	distanceAvg := euclideanDistance(s.avg, peer.avg)
 	distanceHist := euclideanDistance(s.hist, peer.hist)
-	log.Printf("%s => distanceAvg %f, distanceHist: %f", peer.address, distanceAvg, distanceHist)
+	// log.Printf("%s => distanceAvg %f, distanceHist: %f", peer.address, distanceAvg, distanceHist)
 	limit := int(((s.n - peer.n) / 10) % 1000)
 	nRatio := 0.0
 	if peer.n != 0 {
 		nRatio = float64(s.n) / float64(peer.n)
 	}
 	if 0.99 < nRatio && nRatio < 1.01 && distanceAvg < 0.0005 && distanceHist < 0.0005 && s.state == 0 {
-		log.Printf("Decrease number of changes to 1 since stats are close enough %s", peer.address)
+		// log.Printf("Decrease number of changes to 1 since stats are close enough %s", peer.address)
 		limit = 1 // no change can be risky
 	}
 	count := 0
@@ -451,7 +520,7 @@ func (s *knnServiceServer) callExchangeData(client *pb.KnnServiceClient, peer *P
 }
 
 func (s *knnServiceServer) callExchangePeers(client *pb.KnnServiceClient) {
-	log.Printf("callExchangePeers")
+	// log.Printf("callExchangePeers")
 	outputPeerList := make([]*pb.Peer, 0)
 	s.peers.Range(func(key, value interface{}) bool {
 		// address := key.(string)
@@ -504,7 +573,7 @@ func (s *knnServiceServer) SyncJoin() {
 	// log.Printf("Sync Join")
 	s.services.Range(func(key, value interface{}) bool {
 		serviceName := key.(string)
-		log.Printf("Service %s", serviceName)
+		// log.Printf("Service %s", serviceName)
 		if len(serviceName) > 0 {
 			client, conn := s.getClient(serviceName)
 			s.callJoin(client)
@@ -512,10 +581,10 @@ func (s *knnServiceServer) SyncJoin() {
 		}
 		return true
 	})
-	log.Printf("Service loop Ended")
+	// log.Printf("Service loop Ended")
 	s.peers.Range(func(key, value interface{}) bool {
 		peerAddress := key.(string)
-		log.Printf("Peer %s", peerAddress)
+		// log.Printf("Peer %s", peerAddress)
 		if len(peerAddress) > 0 && peerAddress != s.address {
 			peerValue := value.(Peer)
 			client, conn := s.getClient(peerAddress)
@@ -527,7 +596,7 @@ func (s *knnServiceServer) SyncJoin() {
 		}
 		return true
 	})
-	log.Printf("Peer loop Ended")
+	// log.Printf("Peer loop Ended")
 }
 
 func (s *knnServiceServer) syncMapToTree() {
@@ -567,7 +636,7 @@ func (s *knnServiceServer) syncMapToTree() {
 			}
 			return true
 		})
-		log.Printf("Max Distance %f", maxDistance)
+		// log.Printf("Max Distance %f", maxDistance)
 		// log.Printf("hist")
 		// log.Print(hist)
 		// log.Printf("avg")
@@ -598,52 +667,8 @@ func newServer() *knnServiceServer {
 		}
 	}
 	s.maxMemoryMiB = 1024
+	s.timestamp = getCurrentTime()
 	return s
-}
-
-func callKnn(client pb.KnnServiceClient) {
-	id := ksuid.New()
-	request := &pb.KnnRequest{
-		Id:        id.String(),
-		Timestamp: 1233234,
-		Timeout:   5,
-		K:         3,
-		Feature: []float64{
-			0.0,
-			0.0,
-			0.0,
-		},
-	}
-	resp, err := client.GetKnn(context.Background(), request)
-	if err != nil {
-		log.Fatalf("There is an error: %v", err)
-	}
-	// if resp.Success {
-	log.Printf("A new Response has been received with id: %s", resp.Id)
-	features := resp.GetFeatures()
-	for i := 0; i < len(features); i++ {
-		log.Println(features[i].GetLabel())
-	}
-	// }
-}
-
-func callInsert(client pb.KnnServiceClient) {
-	request := &pb.InsertionRequest{
-		Timestamp: getCurrentTime(),
-		Label:     "po" + strconv.FormatInt(int64(rand.Intn(100)), 10),
-		Feature: []float64{
-			rand.Float64(),
-			rand.Float64(),
-			rand.Float64(),
-		},
-	}
-	resp, err := client.Insert(context.Background(), request)
-	if err != nil {
-		log.Fatalf("There is an error: %v", err)
-	}
-	if resp.Code != 0 {
-		log.Printf("A new Response has been received with code: %d", resp.Code)
-	}
 }
 
 func (s *knnServiceServer) check() {
@@ -665,13 +690,13 @@ func (s *knnServiceServer) check() {
 		} else {
 			s.state = 2 // Don't accept insert, delete while sending data
 		}
-		log.Printf("Current Memory = %f MiB => current State %d", currentMemory, s.state)
+		// log.Printf("Current Memory = %f MiB => current State %d", currentMemory, s.state)
 		// millisecondToSleep := int64(((s.latestNumberOfInserts + 100) % 1000) * 10)
 		// log.Printf("millisecondToSleep: %d, len %d", millisecondToSleep, s.n)
 		// time.Sleep(time.Duration(millisecondToSleep) * time.Millisecond)
 
-		currentTime := getCurrentTime()
-		log.Printf("Current Time: %v", currentTime)
+		// currentTime := getCurrentTime()
+		// log.Printf("Current Time: %v", currentTime)
 		if nextSyncJoinTime <= getCurrentTime() {
 			s.SyncJoin()
 			nextSyncJoinTime = getCurrentTime() + 1
@@ -683,10 +708,6 @@ func (s *knnServiceServer) check() {
 			nextSyncMapTime = getCurrentTime() + secondsToSleep
 		}
 		time.Sleep(time.Duration(1000) * time.Millisecond) // always wait one second
-
-		// do some job
-		// log.Println(time.Now().UTC())
-
 	}
 }
 
@@ -695,12 +716,8 @@ func bToMb(b uint64) uint64 {
 }
 
 func GetHeath(w http.ResponseWriter, r *http.Request) {
-	// A very simple health check.
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
-
-	// In the future we could report back on the status of our DB, or our cache
-	// (e.g. Redis) by performing a simple PING, and include them in the response.
 	io.WriteString(w, `{"alive": true}`)
 }
 
@@ -710,7 +727,6 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	response, _ := json.Marshal(payload)
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	w.Write(response)
@@ -733,8 +749,9 @@ func (s *knnServiceServer) PostInsert(w http.ResponseWriter, r *http.Request) {
 	}
 	copy(key.feature[:], in.Feature)
 	value := EuclideanPointValue{
-		timestamp: in.Timestamp,
-		label:     in.Label,
+		timestamp:  in.Timestamp,
+		label:      in.Label,
+		groupLabel: in.GroupLabel,
 	}
 	s.pointsMap.Store(key, value)
 	s.dirty = true
@@ -743,8 +760,6 @@ func (s *knnServiceServer) PostInsert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *knnServiceServer) PostSearch(w http.ResponseWriter, r *http.Request) {
-	// params := mux.Vars(r)
-	// log.Println(r.Body)
 	var in SearchJson
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&in); err != nil {
@@ -752,25 +767,41 @@ func (s *knnServiceServer) PostSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	point := NewEuclideanPointArr(in.Feature)
-	if s.tree != nil {
-		s.treeMu.RLock()
-		ans := s.tree.KNN(point, int(in.K))
-		s.treeMu.RUnlock()
-		responseFeatures := make([]EuclideanPointJson, 0)
-		for i := 0; i < len(ans); i++ {
-			feature := EuclideanPointJson{
-				Feature:   ans[i].GetValues(),
-				Timestamp: ans[i].GetTimestamp(),
-				Label:     ans[i].GetLabel(),
-			}
-			responseFeatures = append(responseFeatures, feature)
-		}
-
-		respondWithJSON(w, http.StatusOK, SearchResultJson{Points: responseFeatures})
-	} else {
-		respondWithJSON(w, http.StatusOK, SearchResultJson{Points: []EuclideanPointJson{}})
+	id := ksuid.New().String()
+	s.knnQueryId.Store(id, getCurrentTime())
+	request := &pb.KnnRequest{
+		Id:        id,
+		Timestamp: in.Timestamp,
+		Timeout:   in.Timeout,
+		K:         int32(in.K),
+		Feature:   in.Feature,
 	}
+	featuresChannel := make(chan pb.Feature, 100) // in.K
+	go s.GetKnnFromPeers(request, featuresChannel)
+	go s.GetKnnFromLocal(request, featuresChannel)
+	// time.Sleep(1 * time.Second)
+	// close(featuresChannel)
+	responseFeatures := make([]EuclideanPointJson, 0)
+	dataAvailable := true
+	timeLimit := time.After(time.Duration(in.Timeout) * time.Millisecond)
+	for dataAvailable {
+		select {
+		case feature := <-featuresChannel:
+			featureJson := EuclideanPointJson{
+				Feature:    feature.Feature,
+				Timestamp:  feature.Timestamp,
+				Label:      feature.Label,
+				GroupLabel: feature.Grouplabel,
+			}
+			log.Printf("New Feature (PostSearch): %v", feature.GetLabel())
+			responseFeatures = append(responseFeatures, featureJson)
+		case <-timeLimit:
+			log.Printf("timeout PostSearch")
+			dataAvailable = false
+			break
+		}
+	}
+	respondWithJSON(w, http.StatusOK, SearchResultJson{Points: responseFeatures})
 }
 
 func (s *knnServiceServer) restApi() {

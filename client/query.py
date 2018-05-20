@@ -15,16 +15,16 @@ def query(vectors, word):
     postdata = {
         'feature': vec,
         'k': 10,
-        'timestamp': 2312323,
-        'timeout': 1212
+        'timestamp': 0,
+        'timeout': 1000
     }
     url = 'http://localhost:8000/v1/search'
     start = time.clock()
     req = urllib2.Request(url, json.dumps(postdata), headers={'Content-type': 'application/json', 'Accept': 'application/json'})
     response = urllib2.urlopen(req)
+    data = json.load(response)
     end = time.clock()
     print("time2: " + str(end-start))
-    data = json.load(response)
     for f in data["points"]:
         print(f["label"])
 
